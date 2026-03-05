@@ -1,0 +1,2 @@
+epoch,finetuning/train_acc_step,finetuning/train_loss_step,step
+0,0.609375,0.6806120276451111,49
