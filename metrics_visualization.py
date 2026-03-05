@@ -8,7 +8,13 @@ import pandas as pd
 from pathlib import Path
 import torch
 import numpy as np
-from sklearn.metrics import roc_curve, auc, confusion_matrix, ConfusionMatrixDisplay
+from sklearn.metrics import (
+    roc_curve,
+    auc,
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+    precision_recall_curve,
+)
 import seaborn as sns
 
 def visualize_attention_maps(model, val_dataset, ring_types, n_samples=4, device='cuda'):
@@ -232,6 +238,48 @@ def plot_roc_curves(finetuned_model, datamodule, label_names=None):
     return probs_all, labels_all
 
 
+def find_best_thresholds(probs_all, labels_all, label_names=None, metric="f1"):
+    """
+    Find per-label decision thresholds based on validation curves.
+
+    Args:
+        probs_all: Array of predicted probabilities, shape (n_samples, n_labels)
+        labels_all: Array of true labels, shape (n_samples, n_labels)
+        label_names: Optional list of label names.
+        metric: One of {'f1', 'youden'}.
+
+    Returns:
+        dict mapping label index to chosen threshold.
+    """
+    if label_names is None:
+        label_names = ['Inner Ring', 'Outer Ring']
+
+    thresholds = {}
+
+    for label_idx, label_name in enumerate(label_names):
+        y_true = labels_all[:, label_idx]
+        y_scores = probs_all[:, label_idx]
+
+        # Use precision-recall curve to maximise F1 by default
+        if metric == "f1":
+            precision, recall, thresh = precision_recall_curve(y_true, y_scores)
+            # precision_recall_curve returns len(thresh) = len(precision) - 1
+            f1_scores = 2 * precision[:-1] * recall[:-1] / (precision[:-1] + recall[:-1] + 1e-8)
+            best_idx = np.argmax(f1_scores)
+            best_thresh = thresh[best_idx]
+        else:
+            # Use ROC curve and Youden's J statistic as a fallback
+            fpr, tpr, thresh = roc_curve(y_true, y_scores)
+            j_scores = tpr - fpr
+            best_idx = np.argmax(j_scores)
+            best_thresh = thresh[best_idx]
+
+        thresholds[label_idx] = float(best_thresh)
+        print(f"{label_name}: chosen threshold = {best_thresh:.3f} ({metric}-based)")
+
+    return thresholds
+
+
 def plot_confusion_matrices(probs_all, labels_all, label_names=None, threshold=0.5):
     """
     Plot confusion matrices for multilabel classification.
@@ -245,8 +293,17 @@ def plot_confusion_matrices(probs_all, labels_all, label_names=None, threshold=0
     if label_names is None:
         label_names = ['Inner Ring', 'Outer Ring']
     
-    # Generate binary predictions (threshold at 0.5)
-    preds_binary = (probs_all > threshold).astype(int)  # Shape: (n_samples, 2)
+    # Support either single scalar threshold or per-label thresholds dict/list.
+    if isinstance(threshold, dict):
+        thr_inner = threshold.get(0, 0.5)
+        thr_outer = threshold.get(1, 0.5)
+        thr_vec = np.array([thr_inner, thr_outer], dtype=np.float32)
+        preds_binary = (probs_all > thr_vec).astype(int)
+    elif isinstance(threshold, (list, tuple, np.ndarray)):
+        thr_vec = np.asarray(threshold, dtype=np.float32)
+        preds_binary = (probs_all > thr_vec).astype(int)
+    else:
+        preds_binary = (probs_all > float(threshold)).astype(int)  # Shape: (n_samples, 2)
     labels_binary = labels_all.astype(int)  # Shape: (n_samples, 2)
 
     print(f"Binary predictions shape: {preds_binary.shape}")

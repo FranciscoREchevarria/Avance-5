@@ -20,10 +20,26 @@ def get_augmentation_transforms(num_channels=3):
         Augmentation transform composition
     """
     return transforms.Compose([
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.RandomVerticalFlip(p=0.5),
-    transforms.RandomRotation(degrees=15, interpolation=transforms.InterpolationMode.BILINEAR)
-])
+        # Geometric invariances (galaxies are approximately rotation/flip invariant)
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.RandomVerticalFlip(p=0.5),
+        transforms.RandomRotation(
+            degrees=180,
+            interpolation=transforms.InterpolationMode.BILINEAR
+        ),
+        transforms.RandomAffine(
+            degrees=0,
+            translate=(0.05, 0.05),
+            scale=(0.9, 1.1),
+            interpolation=transforms.InterpolationMode.BILINEAR
+        ),
+        # Mild photometric jitter to improve robustness to exposure / background variation
+        transforms.ColorJitter(
+            brightness=0.1,
+            contrast=0.1,
+            saturation=0.05
+        ),
+    ])
 
 class FitsDataset(Dataset):
     """
@@ -80,18 +96,25 @@ class FitsDataset(Dataset):
         data = np.asarray(data, dtype=np.float32)
         image_tensor = torch.from_numpy(data)
 
-        data = self._preprocess_fits_bands(data)
-        
-        # Apply preprocessing transforms if provided
-        if self.transform:
+        # Apply preprocessing transforms if provided (e.g. full astrophysical pipeline
+        # defined in the notebook: asinh/sky subtraction/unsharp mask/Lupton RGB/etc.).
+        if self.transform is not None:
             image_tensor = self.transform(image_tensor)
 
-        # Apply augmentation transforms if provided; otherwise, apply standard resizing and normalization transforms
-        if self.augmentation_transform:
+        # Apply augmentation transforms if provided; otherwise, optionally fall back
+        # to a lightweight geometric + normalization pipeline when no preprocessing
+        # pipeline has been supplied.
+        if self.augmentation_transform is not None:
             image_tensor = self.augmentation_transform(image_tensor)
-        else:
-            standard_transform = transforms.Compose([transforms.Resize((244, 244)), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-            image_tensor = standard_transform(image_tensor)
+        elif self.transform is None:
+            default_transform = transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
+            ])
+            image_tensor = default_transform(image_tensor)
         
         # Convert ring_class (0-3) to binary multilabel format [inner_ring, outer_ring]
         ring_class = self.labels[idx]
@@ -158,41 +181,20 @@ class ZoobotFitsDataModule(pl.LightningDataModule):
             temp_paths, temp_labels, test_size=0.5, random_state=42, stratify=temp_labels
         )
 
-        # Balance training set by oversampling to 3000 samples per class (12000 total)
-        # This ensures equal representation of all 4 multilabel combinations
-        target_samples_per_class = 3000
-        balanced_paths = []
-        balanced_labels = []
-        
-        for class_id in range(4):  # Iterate through all 4 multilabel combinations
-            multilabel = RING_CLASS_TO_MULTILABEL[class_id]
-            
-            # Get indices for this class
-            class_indices = [i for i, label in enumerate(train_labels) if label == class_id]
-            current_count = len(class_indices)
-            
-            # Oversample with replacement to reach target
-            sampled_indices = np.random.choice(
-                class_indices, 
-                size=target_samples_per_class, 
-                replace=True
-            )
-            
-            # Add sampled paths and labels
-            for idx in sampled_indices:
-                balanced_paths.append(train_paths[idx])
-                balanced_labels.append(train_labels[idx])
-            
-            print(f"Class {class_id} {multilabel}: {current_count} → {target_samples_per_class} samples")
-        
-        # Replace with balanced versions
-        train_paths = balanced_paths
-        train_labels = np.array(balanced_labels)
+        # Compute per-class counts on the training split for downstream
+        # balancing strategies (e.g. WeightedRandomSampler, loss pos_weights).
+        unique_classes, counts = np.unique(train_labels, return_counts=True)
+        class_counts = dict(zip(unique_classes.tolist(), counts.tolist()))
+        print("Training class distribution (ring_class → count):", class_counts)
 
         # Create datasets for ALL stages
         # FitsDataset will convert ring_class to multilabel format [inner_ring, outer_ring]
-        self.train_ds = FitsDataset(train_paths, train_labels, self.transform, 
-                                     augmentation_transform=self.augmentation_transform)
+        self.train_ds = FitsDataset(
+            train_paths,
+            train_labels,
+            self.transform,
+            augmentation_transform=self.augmentation_transform,
+        )
         self.val_ds = FitsDataset(val_paths, val_labels, self.transform)
         self.test_ds = FitsDataset(test_paths, test_labels, self.transform)
         self.predict_ds = FitsDataset(test_paths, test_labels, self.transform)
@@ -200,18 +202,48 @@ class ZoobotFitsDataModule(pl.LightningDataModule):
 
 
     def train_dataloader(self):
-        # Dataset is already balanced in setup(), use regular shuffling
+        # Use a WeightedRandomSampler to mitigate class imbalance without
+        # constructing an explicitly oversampled training set.
+        train_labels = np.array(self.train_ds.labels)
+        unique_classes, counts = np.unique(train_labels, return_counts=True)
+        class_counts = dict(zip(unique_classes.tolist(), counts.tolist()))
+
+        # Inverse-frequency weighting per class
+        class_weights = {
+            cls: 1.0 / count for cls, count in class_counts.items() if count > 0
+        }
+        sample_weights = np.array([class_weights[int(lbl)] for lbl in train_labels], dtype=np.float32)
+
+        sampler = WeightedRandomSampler(
+            weights=sample_weights,
+            num_samples=len(sample_weights),
+            replacement=True,
+        )
+
         return DataLoader(
-            self.train_ds, 
-            batch_size=self.batch_size, 
-            shuffle=True,
+            self.train_ds,
+            batch_size=self.batch_size,
+            sampler=sampler,
+            num_workers=self.num_workers,
         )
 
     def val_dataloader(self):
-        return DataLoader(self.val_ds, batch_size=self.batch_size, num_workers=self.num_workers)
+        return DataLoader(
+            self.val_ds,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+        )
 
     def test_dataloader(self):
-        return DataLoader(self.test_ds, batch_size=self.batch_size, num_workers=self.num_workers)
+        return DataLoader(
+            self.test_ds,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+        )
     
     def predict_dataloader(self):
-        return DataLoader(self.predict_ds, batch_size=self.batch_size, num_workers=self.num_workers)
+        return DataLoader(
+            self.predict_ds,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+        )
