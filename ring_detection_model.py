@@ -8,16 +8,33 @@ using a pretrained Zoobot encoder.
 import torch
 from torch import nn
 import lightning.pytorch as pl
-from torchmetrics import Accuracy, F1Score, Precision, Recall
+from torchmetrics import Accuracy, F1Score, FBetaScore, Precision, Recall
 
 
-def tune_thresholds_on_val(model, val_dataloader, device, threshold_range=(0.2, 0.8), step=0.05):
+def tune_thresholds_on_val(
+    model,
+    val_dataloader,
+    device,
+    threshold_range=(0.2, 0.9),
+    step=0.02,
+    metric="f2",
+):
     """
-    Sweep decision thresholds on validation set and set model thresholds to maximize macro F1.
-    model: RingDetectionZoobot (or any with predict_proba and inner/outer_ring_threshold).
-    val_dataloader: DataLoader yielding batches with 'image' and 'ring_class'.
-    device: torch device.
-    Returns (best_t_inner, best_t_outer), and sets model.inner_ring_threshold, model.outer_ring_threshold.
+    Optimize inner and outer ring thresholds independently (per-label) on validation set.
+
+    Each label's threshold is tuned separately to maximize the chosen metric for that label,
+    allowing different recall/precision tradeoffs for inner vs outer rings.
+
+    Args:
+        model: RingDetectionZoobot (or any with predict_proba and inner/outer_ring_threshold).
+        val_dataloader: DataLoader yielding batches with 'image' and 'ring_class'.
+        device: torch device.
+        threshold_range: (low, high) for threshold grid.
+        step: Grid step size.
+        metric: Optimization objective per label. 'f2' (recall-weighted) or 'recall'.
+
+    Returns:
+        (best_t_inner, best_t_outer), and sets model.inner_ring_threshold, model.outer_ring_threshold.
     """
     model.eval()
     all_probs = []
@@ -32,25 +49,40 @@ def tune_thresholds_on_val(model, val_dataloader, device, threshold_range=(0.2, 
     probs = torch.cat(all_probs, dim=0)
     labels = torch.cat(all_labels, dim=0)
 
-    f1_metric = F1Score(task='multilabel', num_labels=2, average='macro')
-    best_f1 = -1.0
-    best_t_inner, best_t_outer = 0.5, 0.5
     low, high = threshold_range
-    steps = int((high - low) / step) + 1
-    for i in range(steps):
-        t_inner = low + i * step
-        if t_inner > high:
-            break
-        for j in range(steps):
-            t_outer = low + j * step
-            if t_outer > high:
-                break
-            preds = (probs > torch.tensor([t_inner, t_outer])).float()
-            f1_metric.reset()
-            f1 = f1_metric(preds, labels).item()
-            if f1 > best_f1:
-                best_f1 = f1
-                best_t_inner, best_t_outer = t_inner, t_outer
+    steps = max(1, int((high - low) / step) + 1)
+    thresholds = [
+        low + k * (high - low) / max(1, steps - 1)
+        for k in range(steps)
+    ]
+
+    if metric == "recall":
+        rec_metric = Recall(task='multilabel', num_labels=2, average='none')
+    else:
+        # Default: f2 (weights recall 2x precision)
+        rec_metric = FBetaScore(task='multilabel', num_labels=2, average='none', beta=2.0)
+
+    best_t_inner, best_t_outer = 0.5, 0.5
+
+    # Optimize inner ring threshold (label 0) holding outer at 0.5
+    best_score_inner = -1.0
+    for t in thresholds:
+        preds = (probs > torch.tensor([t, 0.5])).float()
+        rec_metric.reset()
+        score = rec_metric(preds, labels)[0].item()
+        if score > best_score_inner:
+            best_score_inner = score
+            best_t_inner = t
+
+    # Optimize outer ring threshold (label 1) using best_t_inner
+    best_score_outer = -1.0
+    for t in thresholds:
+        preds = (probs > torch.tensor([best_t_inner, t])).float()
+        rec_metric.reset()
+        score = rec_metric(preds, labels)[1].item()
+        if score > best_score_outer:
+            best_score_outer = score
+            best_t_outer = t
 
     model.inner_ring_threshold = best_t_inner
     model.outer_ring_threshold = best_t_outer
