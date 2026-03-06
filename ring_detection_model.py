@@ -11,6 +11,65 @@ import lightning.pytorch as pl
 from torchmetrics import Accuracy, F1Score, Precision, Recall
 
 
+def tune_thresholds_on_val(model, val_dataloader, device, threshold_range=(0.2, 0.8), step=0.05):
+    """
+    Sweep decision thresholds on validation set and set model thresholds to maximize macro F1.
+    model: RingDetectionZoobot (or any with predict_proba and inner/outer_ring_threshold).
+    val_dataloader: DataLoader yielding batches with 'image' and 'ring_class'.
+    device: torch device.
+    Returns (best_t_inner, best_t_outer), and sets model.inner_ring_threshold, model.outer_ring_threshold.
+    """
+    model.eval()
+    all_probs = []
+    all_labels = []
+    with torch.no_grad():
+        for batch in val_dataloader:
+            x = batch['image'].to(device)
+            y = batch['ring_class'].to(device)
+            probs = model.predict_proba(x)
+            all_probs.append(probs.cpu())
+            all_labels.append(y.cpu())
+    probs = torch.cat(all_probs, dim=0)
+    labels = torch.cat(all_labels, dim=0)
+
+    f1_metric = F1Score(task='multilabel', num_labels=2, average='macro')
+    best_f1 = -1.0
+    best_t_inner, best_t_outer = 0.5, 0.5
+    low, high = threshold_range
+    steps = int((high - low) / step) + 1
+    for i in range(steps):
+        t_inner = low + i * step
+        if t_inner > high:
+            break
+        for j in range(steps):
+            t_outer = low + j * step
+            if t_outer > high:
+                break
+            preds = (probs > torch.tensor([t_inner, t_outer])).float()
+            f1_metric.reset()
+            f1 = f1_metric(preds, labels).item()
+            if f1 > best_f1:
+                best_f1 = f1
+                best_t_inner, best_t_outer = t_inner, t_outer
+
+    model.inner_ring_threshold = best_t_inner
+    model.outer_ring_threshold = best_t_outer
+    return best_t_inner, best_t_outer
+
+
+def _focal_bce_loss(logits, targets, pos_weight=None, gamma=2.0):
+    """Focal loss for multilabel: (1 - pt)^gamma * BCE, with optional pos_weight per label."""
+    p = torch.sigmoid(logits)
+    pt = torch.where(targets == 1, p, 1 - p)
+    focal_weight = (1 - pt).clamp(min=1e-6).pow(gamma)
+    bce = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    loss = focal_weight * bce
+    if pos_weight is not None:
+        pw = pos_weight.to(logits.device).expand_as(targets)
+        loss = loss * torch.where(targets == 1, pw, 1.0)
+    return loss.mean()
+
+
 class RingDetectionZoobot(pl.LightningModule):
     def __init__(
         self,
@@ -22,6 +81,9 @@ class RingDetectionZoobot(pl.LightningModule):
         head_lr: float = 1e-4,
         weight_decay: float = 1e-4,
         pos_weight=None,
+        use_focal_loss: bool = False,
+        focal_gamma: float = 2.0,
+        use_head_batchnorm: bool = False,
         **kwargs,
     ):
         """
@@ -37,11 +99,17 @@ class RingDetectionZoobot(pl.LightningModule):
             weight_decay: Weight decay for the optimizer (AdamW).
             pos_weight: Optional tensor/array of shape [2] for BCEWithLogitsLoss
                         to handle class imbalance between inner/outer rings.
+            use_focal_loss: If True, use focal loss instead of BCE (for hard/rare positives).
+            focal_gamma: Gamma for focal loss (default 2.0).
+            use_head_batchnorm: If True, add BatchNorm1d after first linear in head.
         """
         super().__init__()
 
         self.inner_ring_threshold = 0.7
         self.outer_ring_threshold = 0.5
+        self.use_focal_loss = use_focal_loss
+        self.focal_gamma = focal_gamma
+        self._pos_weight_tensor = torch.as_tensor(pos_weight, dtype=torch.float32) if pos_weight is not None else None
 
         # Save lightweight hyperparameters for reproducibility / checkpoints
         self.save_hyperparameters(ignore=["encoder"])
@@ -49,21 +117,27 @@ class RingDetectionZoobot(pl.LightningModule):
         # Store encoder without calling parent init
         self.encoder = encoder
 
-        # Define classification head
-        self.head = nn.Sequential(
+        # Define classification head (optionally with BatchNorm)
+        head_layers = [
             nn.Dropout(p=dropout_rate),
             nn.Linear(encoder_dim, hidden_dim),
             nn.ReLU(),
+        ]
+        if use_head_batchnorm:
+            head_layers.append(nn.BatchNorm1d(hidden_dim))
+        head_layers.extend([
             nn.Dropout(p=dropout_rate / 2),
-            nn.Linear(hidden_dim, 2)  # Binary multilabel output
-        )
+            nn.Linear(hidden_dim, 2),
+        ])
+        self.head = nn.Sequential(*head_layers)
 
         # Loss and metrics
-        if pos_weight is not None:
-            pos_weight_tensor = torch.as_tensor(pos_weight, dtype=torch.float32)
-            self.loss_fn = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
-        else:
+        if not use_focal_loss and pos_weight is not None:
+            self.loss_fn = nn.BCEWithLogitsLoss(pos_weight=self._pos_weight_tensor)
+        elif not use_focal_loss:
             self.loss_fn = nn.BCEWithLogitsLoss()
+        else:
+            self.loss_fn = None  # use _focal_bce_loss in steps
 
         # Core metrics
         self.train_accuracy = Accuracy(task='multilabel', num_labels=2)
@@ -108,7 +182,10 @@ class RingDetectionZoobot(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x, y = batch['image'], batch['ring_class']
         logits = self.forward(x)
-        loss = self.loss_fn(logits, y)
+        if self.loss_fn is not None:
+            loss = self.loss_fn(logits, y)
+        else:
+            loss = _focal_bce_loss(logits, y, self._pos_weight_tensor, self.focal_gamma)
         
         #prediction threshold is performed by class, allowing for different thresholds for inner vs outer ring detection if desired
         threshold = torch.tensor([self.inner_ring_threshold, self.outer_ring_threshold], device=logits.device)
@@ -129,7 +206,10 @@ class RingDetectionZoobot(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         x, y = batch['image'], batch['ring_class']
         logits = self.forward(x)
-        loss = self.loss_fn(logits, y)
+        if self.loss_fn is not None:
+            loss = self.loss_fn(logits, y)
+        else:
+            loss = _focal_bce_loss(logits, y, self._pos_weight_tensor, self.focal_gamma)
         
         #prediction threshold is performed by class, allowing for different thresholds for inner vs outer ring detection if desired
         threshold = torch.tensor([self.inner_ring_threshold, self.outer_ring_threshold], device=logits.device)
@@ -175,7 +255,16 @@ class RingDetectionZoobot(pl.LightningModule):
             weight_decay=self.weight_decay,
         )
 
-        return optimizer
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=3
+        )
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'monitor': 'finetuning/val_loss',
+            },
+        }
     
     def predict(self, x, threshold=0.5):
         probs = self.forward(x).sigmoid()
@@ -193,7 +282,25 @@ class RingDetectionZoobot(pl.LightningModule):
         """
         logits = self.forward(x)
         probabilities = logits.sigmoid()
-        return probabilities 
+        return probabilities
+
+    def predict_proba_tta(self, x, n_rotations=4, flip=True):
+        """
+        Test-time augmentation: average predictions over rotations and optional flips.
+        Views: 0°, 90°, 180°, 270° and, if flip=True, their horizontal flips (8 views).
+        """
+        self.eval()
+        probs_list = []
+        with torch.no_grad():
+            for k in range(n_rotations):
+                x_rot = torch.rot90(x, k=k, dims=(-2, -1))
+                probs_list.append(self.predict_proba(x_rot))
+            if flip:
+                for k in range(n_rotations):
+                    x_rot = torch.rot90(x, k=k, dims=(-2, -1))
+                    x_flip = torch.flip(x_rot, dims=[-1])  # horizontal
+                    probs_list.append(self.predict_proba(x_flip))
+        return torch.stack(probs_list, dim=0).mean(dim=0)
 
     def batch_to_supervised_tuple(self, batch):
         """Convert batch dictionary to (x, y) tuple for training."""

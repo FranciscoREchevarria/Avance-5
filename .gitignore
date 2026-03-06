@@ -1,3 +1,6 @@
 checkpoints/
 backups/
 lightning_logs/
+__pycache__/*.*
+__pycache__/datasets.cpython-314.pyc
+__pycache__/ring_detection_model.cpython-314.pyc

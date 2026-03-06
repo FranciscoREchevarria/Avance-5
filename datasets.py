@@ -33,12 +33,21 @@ def get_augmentation_transforms(num_channels=3):
             scale=(0.9, 1.1),
             interpolation=transforms.InterpolationMode.BILINEAR
         ),
+        # Slight scale/ratio jitter via crop and resize (avoids aggressive crop that could remove rings)
+        transforms.RandomResizedCrop(
+            size=(224, 224),
+            scale=(0.85, 1.0),
+            ratio=(0.95, 1.05),
+            interpolation=transforms.InterpolationMode.BILINEAR,
+        ),
         # Mild photometric jitter to improve robustness to exposure / background variation
         transforms.ColorJitter(
             brightness=0.1,
             contrast=0.1,
             saturation=0.05
         ),
+        # Optional small erasing to simulate artifacts (low prob and scale)
+        transforms.RandomErasing(p=0.1, scale=(0.02, 0.1)),
     ])
 
 class FitsDataset(Dataset):
@@ -199,7 +208,22 @@ class ZoobotFitsDataModule(pl.LightningDataModule):
         self.test_ds = FitsDataset(test_paths, test_labels, self.transform)
         self.predict_ds = FitsDataset(test_paths, test_labels, self.transform)
 
+        # Store train labels for pos_weight computation (ring_class 0-3)
+        self._train_labels = train_labels
 
+    def get_pos_weight(self):
+        """
+        Compute per-label positive weights for BCEWithLogitsLoss.
+        Inner ring positive = ring_class in {1, 3}; outer ring positive = ring_class in {2, 3}.
+        Returns list [w_inner, w_outer] with w_c = (N - N_pos_c) / max(N_pos_c, 1).
+        """
+        labels = np.asarray(self._train_labels)
+        n = len(labels)
+        n_inner = np.sum((labels == 1) | (labels == 3))
+        n_outer = np.sum((labels == 2) | (labels == 3))
+        w_inner = (n - n_inner) / max(n_inner, 1)
+        w_outer = (n - n_outer) / max(n_outer, 1)
+        return [float(w_inner), float(w_outer)]
 
     def train_dataloader(self):
         # Use a WeightedRandomSampler to mitigate class imbalance without
